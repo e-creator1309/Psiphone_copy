@@ -1,0 +1,52 @@
+name: Copy psiphon-android → Psiphone_copy (no history, make private)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  administration: write
+
+jobs:
+  copy-and-privatize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install git-lfs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      - name: Clone psiphon-android (latest snapshot + submodules)
+        run: |
+          git clone --depth=1 --recurse-submodules \
+            https://github.com/e-creator1309/psiphon-android.git source
+
+      - name: Strip all git metadata and re-init as fresh repo
+        run: |
+          cd source
+          find . -name ".git" -type d -exec rm -rf {} + 2>/dev/null || true
+          rm -f .gitmodules
+          git init -b master
+          git config user.email "action@github.com"
+          git config user.name "GitHub Actions"
+          git add -A
+          git commit -m "Initial commit (snapshot of psiphon-android, history stripped)"
+
+      - name: Force-push to Psiphone_copy
+        run: |
+          cd source
+          git remote add origin \
+            https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/e-creator1309/Psiphone_copy.git
+          git push --force origin master
+
+      - name: Make Psiphone_copy private
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/e-creator1309/Psiphone_copy \
+            -d '{"private":true}')
+          echo "PATCH status: $STATUS"
+          [ "$STATUS" = "200" ] && echo "Repo is now private." || { echo "Failed to set private (status $STATUS)"; exit 1; }
