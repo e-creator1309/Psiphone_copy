@@ -1,0 +1,211 @@
+name: Build Psiphon APK
+
+on:
+    workflow_dispatch:
+    push:
+      branches: [ master ]
+
+jobs:
+    build:
+      runs-on: ubuntu-latest
+      container:
+        image: ubuntu:20.04
+
+      steps:
+        - name: Install system dependencies
+          run: |
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y \
+              curl wget unzip git git-lfs perl \
+              openjdk-17-jdk libtinfo5 build-essential zip python3
+
+        - name: Fix git safe directory (Docker root user)
+          run: git config --global --add safe.directory '*'
+
+        - name: Checkout psiphon-android
+          uses: actions/checkout@v4
+          with:
+            submodules: recursive
+            lfs: true
+
+        - name: Ensure EmbeddedValues.java exists
+          run: |
+            DEST="app/src/main/java/com/psiphon3/psiphonlibrary/EmbeddedValues.java"
+            [ -f "$DEST" ] && echo "EmbeddedValues.java present." || { echo "ERROR: missing!"; exit 1; }
+
+        # ── Inject real server entry (if SERVER_ENTRY secret is set) ────────────
+        - name: Inject psiphond server entry into EmbeddedValues.java
+          env:
+            SERVER_ENTRY: ${{ secrets.SERVER_ENTRY }}
+            SERVER_ENTRY_KEY: ${{ secrets.SERVER_ENTRY_KEY }}
+          run: python3 scripts/inject-server-entry.py
+
+        # ── Android SDK ─────────────────────────────────────────────────────────
+        - name: Cache Android SDK
+          id: cache-sdk
+          uses: actions/cache@v4
+          with:
+            path: /opt/android-sdk
+            key: android-sdk-35-ndk17-ndk27-v3
+            restore-keys: android-sdk-35-ndk17-ndk27-
+
+        - name: Set up Android SDK cmdline-tools
+          if: steps.cache-sdk.outputs.cache-hit != 'true'
+          run: |
+            mkdir -p /opt/android-sdk/cmdline-tools
+            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+                 -O /tmp/cmdtools.zip
+            unzip -q /tmp/cmdtools.zip -d /tmp/cmdtools
+            mv /tmp/cmdtools/cmdline-tools /opt/android-sdk/cmdline-tools/latest
+
+        - name: Export Android SDK env vars
+          run: |
+            echo "ANDROID_HOME=/opt/android-sdk"     >> $GITHUB_ENV
+            echo "ANDROID_SDK_ROOT=/opt/android-sdk" >> $GITHUB_ENV
+            echo "/opt/android-sdk/cmdline-tools/latest/bin" >> $GITHUB_PATH
+            echo "/opt/android-sdk/platform-tools"           >> $GITHUB_PATH
+
+        - name: Accept licenses and install SDK + NDK r17c + NDK r27c
+          if: steps.cache-sdk.outputs.cache-hit != 'true'
+          run: |
+            yes | /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager --licenses
+            for attempt in 1 2 3; do
+              /opt/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+                "platform-tools" \
+                "platforms;android-35" \
+                "build-tools;35.0.0" \
+                "ndk;17.2.4988734" \
+                "ndk;27.2.12479018" && break
+              echo "sdkmanager attempt $attempt failed, retrying..."
+              sleep 10
+            done
+
+        # gomobile reads meta/platforms.json to find NDK min API.
+        # NDK r27c ships with {"min":16,"max":35} — gomobile rejects min<21.
+        - name: Patch NDK r27c meta/platforms.json so gomobile accepts it (min 16→21)
+          run: |
+            FILE=/opt/android-sdk/ndk/27.2.12479018/meta/platforms.json
+            echo "Before: $(cat $FILE)"
+            echo '{"min":21,"max":35}' > "$FILE"
+            echo "After:  $(cat $FILE)"
+
+        # ── Build ca.psiphon.aar from open-source tunnel-core ──────────────────
+        - name: Get tunnel-core HEAD SHA (cache key)
+          id: tc-sha
+          run: |
+            SHA=$(git ls-remote https://github.com/Psiphon-Labs/psiphon-tunnel-core.git HEAD \
+                  | awk '{print $1}' | cut -c1-16)
+            echo "sha=$SHA" >> $GITHUB_OUTPUT
+            echo "Tunnel-core SHA: $SHA"
+
+        - name: Cache built ca.psiphon.aar
+          id: cache-aar
+          uses: actions/cache@v4
+          with:
+            path: /tmp/built-aar/ca.psiphon.aar
+            key: psiphon-aar-arm64-ndk27-v7-${{ steps.tc-sha.outputs.sha }}
+
+        - name: Install Go 1.26.3
+          if: steps.cache-aar.outputs.cache-hit != 'true'
+          run: |
+            wget -q https://go.dev/dl/go1.26.3.linux-amd64.tar.gz -O /tmp/go.tar.gz
+            tar -C /usr/local -xzf /tmp/go.tar.gz
+            echo "/usr/local/go/bin" >> $GITHUB_PATH
+            /usr/local/go/bin/go version
+
+        - name: Install gomobile + gobind
+          if: steps.cache-aar.outputs.cache-hit != 'true'
+          run: |
+            export PATH=$PATH:/usr/local/go/bin
+            export GOPATH=/tmp/gopath
+            go install golang.org/x/mobile/cmd/gomobile@latest
+            go install golang.org/x/mobile/cmd/gobind@latest
+            mkdir -p /tmp/gopath/src/golang.org/x
+            git clone --depth=1 https://github.com/golang/mobile \
+              /tmp/gopath/src/golang.org/x/mobile
+            echo "/tmp/gopath/bin" >> $GITHUB_PATH
+            /tmp/gopath/bin/gomobile version
+
+        - name: Clone psiphon-tunnel-core to GOPATH
+          if: steps.cache-aar.outputs.cache-hit != 'true'
+          run: |
+            mkdir -p /tmp/gopath/src/github.com/Psiphon-Labs
+            git clone --depth=1 \
+              https://github.com/Psiphon-Labs/psiphon-tunnel-core.git \
+              /tmp/gopath/src/github.com/Psiphon-Labs/psiphon-tunnel-core
+            echo "Cloned: $(cd /tmp/gopath/src/github.com/Psiphon-Labs/psiphon-tunnel-core && git rev-parse --short HEAD)"
+
+        - name: Apply optimized make.bash (arm64-only + trimpath)
+          if: steps.cache-aar.outputs.cache-hit != 'true'
+          run: |
+            cp tunnel-core/patches/make.bash \
+               /tmp/gopath/src/github.com/Psiphon-Labs/psiphon-tunnel-core/MobileLibrary/Android/make.bash
+
+        - name: Build ca.psiphon.aar from source
+          if: steps.cache-aar.outputs.cache-hit != 'true'
+          env:
+            ANDROID_HOME: /opt/android-sdk
+            ANDROID_NDK_HOME: /opt/android-sdk/ndk/27.2.12479018
+            ANDROID_PLATFORM_VERSION: "35"
+            GO111MODULE: "off"
+            GOPATH: /tmp/gopath
+            GOCACHE: /tmp/gocache
+          run: |
+            export PATH=$PATH:/usr/local/go/bin:/tmp/gopath/bin
+            cd /tmp/gopath/src/github.com/Psiphon-Labs/psiphon-tunnel-core/MobileLibrary/Android
+            bash make.bash
+            mkdir -p /tmp/built-aar
+            cp ca.psiphon.aar /tmp/built-aar/ca.psiphon.aar
+            echo "Built AAR: $(du -h /tmp/built-aar/ca.psiphon.aar | cut -f1)"
+
+        - name: Use built/cached ca.psiphon.aar
+          run: |
+            cp /tmp/built-aar/ca.psiphon.aar app/libs/ca.psiphon.aar
+            echo "AAR in use: $(du -h app/libs/ca.psiphon.aar | cut -f1)"
+
+        # ── Gradle ──────────────────────────────────────────────────────────────
+        - name: Cache Gradle
+          uses: actions/cache@v4
+          with:
+            path: |
+              /root/.gradle/caches
+              /root/.gradle/wrapper
+            key: gradle-${{ hashFiles('**/*.gradle', '**/gradle-wrapper.properties') }}
+            restore-keys: gradle-
+
+        - name: Generate self-signed keystore
+          run: |
+            keytool -genkeypair \
+              -keystore psiphon-release.keystore \
+              -alias psiphon \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass password -keypass password \
+              -dname "CN=Psiphon,OU=Build,O=Build,L=Unknown,S=Unknown,C=US"
+
+        - name: Create signing.properties
+          run: |
+            echo "STORE_FILE=$(pwd)/psiphon-release.keystore" > signing.properties
+            echo "STORE_PASSWORD=password"                    >> signing.properties
+            echo "KEY_ALIAS=psiphon"                         >> signing.properties
+            echo "KEY_PASSWORD=password"                     >> signing.properties
+
+        - name: Grant execute permission for gradlew
+          run: chmod +x gradlew
+
+        - name: Build Release APK
+          run: ./gradlew assembleRelease --no-daemon --build-cache --parallel --stacktrace
+          env:
+            JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+            ANDROID_HOME: /opt/android-sdk
+            ANDROID_SDK_ROOT: /opt/android-sdk
+            ANDROID_NDK_HOME: /opt/android-sdk/ndk/17.2.4988734
+            ANDROID_NDK_ROOT: /opt/android-sdk/ndk/17.2.4988734
+            GRADLE_OPTS: "-Xmx4g -Dorg.gradle.daemon=false -Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+
+        - name: Upload APK
+          uses: actions/upload-artifact@v4
+          with:
+            name: psiphon-release-apk
+            path: app/build/outputs/apk/release/*.apk
+            retention-days: 14
