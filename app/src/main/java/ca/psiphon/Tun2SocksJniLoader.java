@@ -46,4 +46,14 @@ public class Tun2SocksJniLoader {
 
     // Stops tun2socks
     public native static void terminateTun2Socks();
+
+    // ==== PSIPHON GAMING: Phase 4 — inject game server response into TUN ====
+    // Called from DirectUdpManager when a game server response arrives.
+    // All IP/port values are in host byte order.
+    public native static void injectGameUdpResponse(
+            int serverIpHO, int serverPortHO,
+            int clientIpHO, int clientPortHO,
+            byte[] payload);
+    // ==== PSIPHON GAMING END ====
+
 }
