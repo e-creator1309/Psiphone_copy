@@ -1470,36 +1470,28 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             }
 
 
-            // ── GAMING MODE: Force UDP-only via QUIC-OSSH ───────────────────────────
-            // Servers advertise QUICv1 capability; Go library protocol name is QUIC-OSSH.
-            // This forces the Psiphon Go tunnel to skip all TCP protocols (SSH/OSSH/TLS/Meek)
-            // and connect exclusively over UDP/QUIC — lower latency, better for gaming.
-            JSONArray limitProtocols = new JSONArray();
-            limitProtocols.put("QUIC-OSSH");
-            json.put("LimitTunnelProtocols", limitProtocols);
-
-            // Aggressive latency tuning (GearUP-style: optimise for RTT not throughput)
-            if (!tunnelConfig.disableTimeouts) {
-                json.put("NetworkLatencyMultiplierLambda", 0.1);
-            }
-            // Try multiple servers in parallel for fastest first-connect
-            json.put("ConnectionWorkerPoolSize", 5);
-            // No stagger — fire all workers at once (GearUP: simultaneous relay probe)
-            json.put("StaggerConnectionWorkersMilliseconds", 0);
-            // 5 candidates in the initial fast-selection phase
+            // ── GAMING MODE: Prefer QUIC-OSSH, fall back to TCP if QUIC is blocked ─────────
+            //
+            // WHY InitialLimitTunnelProtocols instead of LimitTunnelProtocols:
+            //   Hard lock = if QUIC is ISP-blocked the tunnel loops forever.
+            //   Soft prefer = tries QUIC for first 5 candidates, then falls back.
+            //
+            // WHY no NetworkLatencyMultiplierLambda:
+            //   Default lambda=2.0 -> mean multiplier 0.5 (timeouts faster).
+            //   We had 0.1 -> mean multiplier 10 (timeouts 20x SLOWER than default).
+            //   Games appeared hung because every handshake waited 10x too long.
+            //
+            // WHY no LimitServerEntryRegions:
+            //   Restricting to 3 regions = no fallback if those servers are busy.
+            //   UdpLatencyChecker still probes in background; just not a hard filter.
+            //
+            JSONArray initialProtocols = new JSONArray();
+            initialProtocols.put("QUIC-OSSH");
+            json.put("InitialLimitTunnelProtocols", initialProtocols);
+            // Try 5 servers with QUIC preference before opening to all protocols
             json.put("InitialLimitTunnelProtocolsCandidateCount", 5);
-            // Reconnect in 1 s on drop — critical for gaming (prevents game kick)
-            json.put("EstablishTunnelPausePeriodSeconds", 1);
-            // Best-region routing: use UdpLatencyChecker results when user has no region pref
-            if (TextUtils.isEmpty(tunnelConfig.egressRegion)
-                    || PsiphonConstants.REGION_CODE_ANY.equals(tunnelConfig.egressRegion)) {
-                String fastestRegionsJson =
-                        UdpLatencyChecker.getStoredFastestRegionsJson(context);
-                if (!TextUtils.isEmpty(fastestRegionsJson)) {
-                    json.put("LimitServerEntryRegions", new JSONArray(fastestRegionsJson));
-                    MyLog.i("GamingMode: limiting to fastest regions: " + fastestRegionsJson);
-                }
-            }
+            // 5 workers race in parallel — fastest server wins
+            json.put("ConnectionWorkerPoolSize", 5);
             // ────────────────────────────────────────────────────────────────────────
             return json.toString();
         } catch (JSONException e) {
