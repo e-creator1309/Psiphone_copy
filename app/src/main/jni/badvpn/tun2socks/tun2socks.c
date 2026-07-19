@@ -231,7 +231,80 @@ static void tcp_timer_handler (void *unused);
 static void device_error_handler (void *unused);
 static void device_read_handler_send (void *unused, uint8_t *data, int data_len);
 static int process_device_udp_packet (uint8_t *data, int data_len);
-static err_t netif_init_func (struct netif *netif);
+static // ==== PSIPHON GAMING: injectGameUdpResponseNative ====
+// Builds an IPv4+UDP packet from a game-server response and writes it
+// directly to the TUN fd so the game app receives it as a normal packet.
+// Called from Java (DirectUdpManager receiver thread).
+// All IP/port args are in host byte order.
+#include <stdlib.h>
+#include <unistd.h>
+#include <netinet/in.h>
+
+static void injectGameUdpResponseNative(
+    JNIEnv *env, jclass cls,
+    jint serverIpHO,   /* game-server IP,   host byte order */
+    jint serverPortHO, /* game-server port, host byte order */
+    jint clientIpHO,   /* game-app IP,      host byte order */
+    jint clientPortHO, /* game-app port,    host byte order */
+    jbyteArray jpayload)
+{
+    if (!jpayload) return;
+    jsize plen = (*env)->GetArrayLength(env, jpayload);
+    if (plen <= 0 || plen > 65507) return;
+
+    int total = 20 + 8 + (int)plen; /* IPv4 hdr + UDP hdr + payload */
+    uint8_t *buf = (uint8_t *)malloc((size_t)total);
+    if (!buf) return;
+
+    jbyte *pl = (*env)->GetByteArrayElements(env, jpayload, NULL);
+    if (!pl) { free(buf); return; }
+    memcpy(buf + 28, pl, (size_t)plen);
+    (*env)->ReleaseByteArrayElements(env, jpayload, pl, JNI_ABORT);
+
+    /* Convert to network byte order */
+    uint32_t sip    = htonl((uint32_t)serverIpHO);
+    uint32_t dip    = htonl((uint32_t)clientIpHO);
+    uint16_t sport  = htons((uint16_t)(serverPortHO & 0xFFFF));
+    uint16_t dport  = htons((uint16_t)(clientPortHO & 0xFFFF));
+    uint16_t udplen = htons(8 + (uint16_t)plen);
+
+    /* UDP header: bytes 20-27 */
+    memcpy(buf + 20, &sport,  2);
+    memcpy(buf + 22, &dport,  2);
+    memcpy(buf + 24, &udplen, 2);
+    buf[26] = 0; buf[27] = 0; /* checksum = 0 is valid for IPv4 UDP */
+
+    /* IPv4 header: bytes 0-19 */
+    uint16_t totlen = htons((uint16_t)total);
+    buf[0]  = 0x45; buf[1]  = 0x00;   /* version=4, IHL=5, DSCP=0 */
+    memcpy(buf + 2,  &totlen, 2);
+    buf[4]  = 0;    buf[5]  = 0;      /* identification = 0 */
+    buf[6]  = 0x40; buf[7]  = 0;     /* DF flag, fragment offset = 0 */
+    buf[8]  = 64;                      /* TTL */
+    buf[9]  = 17;                      /* protocol: UDP */
+    buf[10] = 0;    buf[11] = 0;      /* header checksum placeholder */
+    memcpy(buf + 12, &sip, 4);
+    memcpy(buf + 16, &dip, 4);
+
+    /* Compute IPv4 header checksum (one's complement sum) */
+    uint32_t cs = 0;
+    for (int i = 0; i < 20; i += 2) {
+        uint16_t w; memcpy(&w, buf + i, 2); cs += (uint32_t)ntohs(w);
+    }
+    cs = (cs >> 16) + (cs & 0xFFFF);
+    cs += (cs >> 16);
+    uint16_t ip_cs = htons(~(uint16_t)cs);
+    memcpy(buf + 10, &ip_cs, 2);
+
+    /* Atomic write to TUN fd — safe for packet-mode char devices */
+    if (options.tun_fd > 0) {
+        write(options.tun_fd, buf, (size_t)total);
+    }
+    free(buf);
+}
+// ==== PSIPHON GAMING END ====
+
+err_t netif_init_func (struct netif *netif);
 static err_t netif_output_func (struct netif *netif, struct pbuf *p, ip_addr_t *ipaddr);
 static err_t netif_output_ip6_func (struct netif *netif, struct pbuf *p, ip6_addr_t *ipaddr);
 static err_t common_netif_output (struct netif *netif, struct pbuf *p);
@@ -266,7 +339,32 @@ static JavaVM *g_vm = NULL;
 static jclass g_logClass = NULL;
 static jmethodID g_logMethod = NULL;
 
-static void runTun2SocksNative(
+static // ==== PSIPHON GAMING: cache DirectUdpManager.onGameUdpPacket ====
+static void direct_udp_cache_method(JNIEnv *env) {
+    jclass local = (*env)->FindClass(env, "com/psiphon3/psiphonlibrary/DirectUdpManager");
+    if (local == NULL) {
+        (*env)->ExceptionClear(env);
+        BLog(BLOG_WARNING, "DirectUdpManager: class not found; bypass disabled");
+        return;
+    }
+    g_directUdpClass = (*env)->NewGlobalRef(env, local);
+    (*env)->DeleteLocalRef(env, local);
+    if (!g_directUdpClass) return;
+    g_directUdpMethod = (*env)->GetStaticMethodID(
+        env, g_directUdpClass, "onGameUdpPacket", "(IIII[B)V");
+    if (!g_directUdpMethod) {
+        (*env)->ExceptionClear(env);
+        (*env)->DeleteGlobalRef(env, g_directUdpClass);
+        g_directUdpClass = NULL;
+        BLog(BLOG_WARNING, "DirectUdpManager: onGameUdpPacket not found; bypass disabled");
+        return;
+    }
+    g_directUdpEnabled = 1;
+    BLog(BLOG_NOTICE, "DirectUdpManager: direct UDP bypass enabled");
+}
+// ==== PSIPHON GAMING END ====
+
+void runTun2SocksNative(
         JNIEnv *env,
         jclass cls,
         jint vpn_interface_file_descriptor,
@@ -277,6 +375,17 @@ static void runTun2SocksNative(
         jstring socks_server_address,
         jstring udpgw_server_address,
         jint udpgw_transparent_dns);
+
+// ==== PSIPHON GAMING: Direct UDP bypass — JNI cache ====
+static jclass    g_directUdpClass   = NULL;
+static jmethodID g_directUdpMethod  = NULL;
+static volatile int g_directUdpEnabled = 0;
+
+static void injectGameUdpResponseNative(JNIEnv *env, jclass cls,
+    jint serverIpHO, jint serverPortHO,
+    jint clientIpHO, jint clientPortHO,
+    jbyteArray jpayload);
+// ==== PSIPHON GAMING END ====
 
 static void terminateTun2SocksNative(
         JNIEnv *env,
@@ -303,7 +412,10 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
     static JNINativeMethod method_table[] = {
         {"runTun2Socks","(IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V", (void *) runTun2SocksNative},
         {"terminateTun2Socks", "()V", (void *) terminateTun2SocksNative},
-        {"initTun2socksLogger", "(Ljava/lang/String;Ljava/lang/String;)V", (void *) initTun2socksLoggerNative}
+        {"initTun2socksLogger", "(Ljava/lang/String;Ljava/lang/String;)V", (void *) initTun2socksLoggerNative},
+        // ==== PSIPHON GAMING ====
+        {"injectGameUdpResponse", "(IIII[B)V", (void *) injectGameUdpResponseNative}
+        // ==== PSIPHON GAMING END ====
     };
 
     jint method_count = sizeof(method_table) / sizeof(method_table[0]);
@@ -329,6 +441,15 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *vm, void *reserved) {
         g_logClass = NULL;
     }
     g_logMethod = NULL;
+
+    // ==== PSIPHON GAMING ====
+    if (g_directUdpClass != NULL) {
+        (*env)->DeleteGlobalRef(env, g_directUdpClass);
+        g_directUdpClass  = NULL;
+    }
+    g_directUdpMethod  = NULL;
+    g_directUdpEnabled = 0;
+    // ==== PSIPHON GAMING END ====
 
     if ((*g_vm)->GetEnv(g_vm, (void **) &env, JNI_VERSION_1_6) == JNI_EDETACHED) {
         (*g_vm)->DetachCurrentThread(g_vm);
@@ -416,6 +537,10 @@ void runTun2SocksNative(
     const char *udpgwServerAddressStr = (*env)->GetStringUTFChars(env, udpgw_server_address, 0);
 
     init_arguments("Psiphon tun2socks");
+
+    // ==== PSIPHON GAMING: cache DirectUdpManager JNI method ====
+    direct_udp_cache_method(env);
+    // ==== PSIPHON GAMING END ====
 
     options.tun_fd = vpn_interface_file_descriptor;
     options.tun_mtu = vpn_interface_mtu;
@@ -1413,7 +1538,42 @@ int process_device_udp_packet (uint8_t *data, int data_len)
         BLog(BLOG_ERROR, "packet is too large, cannot send to udpgw");
         goto fail;
     }
-    
+
+    // ==== PSIPHON GAMING: Phase 4 — direct UDP bypass for non-DNS game traffic ====
+    // DNS stays tunnelled for censorship circumvention. All other UDP goes directly
+    // via a Java-protected DatagramSocket, eliminating TCP SOCKS5 wrapping and the
+    // 999 ms head-of-line blocking spikes caused by TCP-inside-QUIC retransmits.
+    if (!is_dns && g_directUdpEnabled && local_addr.type == BADDR_TYPE_IPV4) {
+        JNIEnv *jenv = NULL;
+        int did_attach = 0;
+        if ((*g_vm)->GetEnv(g_vm, (void **)&jenv, JNI_VERSION_1_6) == JNI_EDETACHED) {
+            did_attach = ((*g_vm)->AttachCurrentThread(g_vm, &jenv, NULL) == 0);
+        }
+        if (jenv != NULL) {
+            jint src_ip   = (jint)ntohl(local_addr.ipv4.ip);
+            jint src_port = (jint)ntohs(local_addr.ipv4.port);
+            jint dst_ip   = (jint)ntohl(remote_addr.ipv4.ip);
+            jint dst_port = (jint)ntohs(remote_addr.ipv4.port);
+            jbyteArray jpayload = (*jenv)->NewByteArray(jenv, (jsize)data_len);
+            if (jpayload != NULL) {
+                (*jenv)->SetByteArrayRegion(jenv, jpayload, 0, (jsize)data_len,
+                                            (const jbyte *)data);
+                (*jenv)->CallStaticVoidMethod(jenv, g_directUdpClass, g_directUdpMethod,
+                                             src_ip, src_port, dst_ip, dst_port, jpayload);
+                (*jenv)->DeleteLocalRef(jenv, jpayload);
+                if ((*jenv)->ExceptionCheck(jenv)) {
+                    (*jenv)->ExceptionClear(jenv);
+                } else {
+                    if (did_attach) (*g_vm)->DetachCurrentThread(g_vm);
+                    return 1; /* handled — bypass udpgw TCP path */
+                }
+            }
+        }
+        if (did_attach) (*g_vm)->DetachCurrentThread(g_vm);
+        /* fall through to udpgw on any JNI failure */
+    }
+    // ==== PSIPHON GAMING END ====
+
     // submit packet to udpgw
     SocksUdpGwClient_SubmitPacket(&udpgw_client, local_addr, remote_addr, is_dns, data, data_len);
     
