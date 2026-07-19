@@ -550,6 +550,9 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
     private Single<Config> getTunnelConfigSingle() {
         final AppPreferences multiProcessPreferences = new AppPreferences(getContext());
 
+        // ── GAMING MODE: probe server latency in background (GearUP-style relay ranking) ──
+        UdpLatencyChecker.runInBackground(getContext());
+        // ────────────────────────────────────────────────────────────────────────────────────
         Single<Config> configSingle = Single.fromCallable(() -> {
             Config tunnelConfig = new Config();
             tunnelConfig.egressRegion = multiProcessPreferences
@@ -1293,6 +1296,13 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             }
         }
 
+        // ── GAMING MODE: Browser / streaming bypass (GearUP: non-game traffic goes direct) ──
+        // Only in ALL_APPS / EXCLUDE_APPS mode — addDisallowedApplication is safe here.
+        // INCLUDE_APPS mode already called addAllowedApplication; mixing would throw.
+        if (vpnAppsExclusionSetting != VpnAppsUtils.VpnAppsExclusionSetting.INCLUDE_APPS) {
+            GamingModeConfig.applyBrowserBypass(vpnBuilder, pm);
+        }
+        // ────────────────────────────────────────────────────────────────────────────────
         return vpnBuilder;
     }
 
@@ -1474,6 +1484,22 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             }
             // Try multiple servers in parallel for fastest first-connect
             json.put("ConnectionWorkerPoolSize", 5);
+            // No stagger — fire all workers at once (GearUP: simultaneous relay probe)
+            json.put("StaggerConnectionWorkersMilliseconds", 0);
+            // 5 candidates in the initial fast-selection phase
+            json.put("InitialLimitTunnelProtocolsCandidateCount", 5);
+            // Reconnect in 1 s on drop — critical for gaming (prevents game kick)
+            json.put("EstablishTunnelPausePeriodSeconds", 1);
+            // Best-region routing: use UdpLatencyChecker results when user has no region pref
+            if (TextUtils.isEmpty(tunnelConfig.egressRegion)
+                    || PsiphonConstants.REGION_CODE_ANY.equals(tunnelConfig.egressRegion)) {
+                String fastestRegionsJson =
+                        UdpLatencyChecker.getStoredFastestRegionsJson(context);
+                if (!TextUtils.isEmpty(fastestRegionsJson)) {
+                    json.put("LimitServerEntryRegions", new JSONArray(fastestRegionsJson));
+                    MyLog.i("GamingMode: limiting to fastest regions: " + fastestRegionsJson);
+                }
+            }
             // ────────────────────────────────────────────────────────────────────────
             return json.toString();
         } catch (JSONException e) {
