@@ -1470,12 +1470,12 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             }
 
 
-            // ── GAMING MODE: Force UDP-only via QUICv1 ──────────────────────────────
-            // Servers already advertise QUICv1 in their capabilities + sshObfuscatedQUICPort.
+            // ── GAMING MODE: Force UDP-only via QUIC-OSSH ───────────────────────────
+            // Servers advertise QUICv1 capability; Go library protocol name is QUIC-OSSH.
             // This forces the Psiphon Go tunnel to skip all TCP protocols (SSH/OSSH/TLS/Meek)
             // and connect exclusively over UDP/QUIC — lower latency, better for gaming.
             JSONArray limitProtocols = new JSONArray();
-            limitProtocols.put("QUICv1");
+            limitProtocols.put("QUIC-OSSH");
             json.put("LimitTunnelProtocols", limitProtocols);
 
             // Aggressive latency tuning (GearUP-style: optimise for RTT not throughput)
