@@ -98,6 +98,9 @@ public class VpnManager {
     public interface VpnServiceBuilderProvider {
         // Return a VpnService.Builder instance to use for creating the VPN interface
         VpnService.Builder vpnServiceBuilder();
+        // ==== PSIPHON GAMING: expose the underlying VpnService for socket protection ====
+        VpnService getVpnService();
+        // ==== PSIPHON GAMING END ====
     }
 
     // Register a host service
@@ -285,6 +288,15 @@ public class VpnManager {
         if (mTun2SocksThread != null) {
             return;
         }
+        // ==== PSIPHON GAMING: start direct UDP bypass (Phase 4) ====
+        {
+            VpnServiceBuilderProvider provider =
+                    (vpnServiceBuilderProviderRef != null) ? vpnServiceBuilderProviderRef.get() : null;
+            if (provider != null) {
+                com.psiphon3.psiphonlibrary.DirectUdpManager.start(provider.getVpnService());
+            }
+        }
+        // ==== PSIPHON GAMING END ====
         mTun2SocksThread = new Thread(() -> Tun2SocksJniLoader.runTun2Socks(
                 vpnInterfaceFileDescriptor.detachFd(),
                 vpnInterfaceMTU,
@@ -300,6 +312,9 @@ public class VpnManager {
 
     private void stopTun2Socks() {
         if (mTun2SocksThread != null) {
+            // ==== PSIPHON GAMING: stop direct UDP bypass before tun2socks ====
+            com.psiphon3.psiphonlibrary.DirectUdpManager.stop();
+            // ==== PSIPHON GAMING END ====
             try {
                 Tun2SocksJniLoader.terminateTun2Socks();
                 mTun2SocksThread.join();
