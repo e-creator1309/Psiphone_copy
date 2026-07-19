@@ -1459,6 +1459,22 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
                 json.put("InproxyClientPersonalCompartmentID", tunnelConfig.personalPairingCompartmentId);
             }
 
+
+            // ── GAMING MODE: Force UDP-only via QUICv1 ──────────────────────────────
+            // Servers already advertise QUICv1 in their capabilities + sshObfuscatedQUICPort.
+            // This forces the Psiphon Go tunnel to skip all TCP protocols (SSH/OSSH/TLS/Meek)
+            // and connect exclusively over UDP/QUIC — lower latency, better for gaming.
+            JSONArray limitProtocols = new JSONArray();
+            limitProtocols.put("QUICv1");
+            json.put("LimitTunnelProtocols", limitProtocols);
+
+            // Aggressive latency tuning (GearUP-style: optimise for RTT not throughput)
+            if (!tunnelConfig.disableTimeouts) {
+                json.put("NetworkLatencyMultiplierLambda", 0.1);
+            }
+            // Try multiple servers in parallel for fastest first-connect
+            json.put("ConnectionWorkerPoolSize", 5);
+            // ────────────────────────────────────────────────────────────────────────
             return json.toString();
         } catch (JSONException e) {
             return null;
