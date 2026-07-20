@@ -283,6 +283,13 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
         );
 
         m_compositeDisposable.add(connectionStatusUpdaterDisposable());
+
+        // ── GAMING MODE: Start remote config fetcher (GearUP-style server push) ──────────────
+        // Downloads a JSON config from a configurable URL and caches it locally.
+        // If no URL is set this is a no-op.  To enable, call:
+        //   RemoteConfigManager.setConfigUrl(context, "https://your-server/boost.json");
+        RemoteConfigManager.scheduleFetch(getContext());
+        // ────────────────────────────────────────────────────────────────────────────────────
     }
 
     // Implementation of android.app.Service.onStartCommand
@@ -1465,7 +1472,15 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
                 json.put("ClientFeatures", clientFeaturesJsonArray);
             }
 
-            json.put("DNSResolverAlternateServers", new JSONArray("[\"1.1.1.1\", \"1.0.0.1\", \"8.8.8.8\", \"8.8.4.4\"]"));
+            // DNS alternate servers — remote config can override (e.g. regional DOH endpoints)
+            RemoteConfigManager.AppliedConfig _rc = RemoteConfigManager.getApplied();
+            if (_rc.dnsAlternateServers != null && !_rc.dnsAlternateServers.isEmpty()) {
+                JSONArray dnsArr = new JSONArray();
+                for (String dns : _rc.dnsAlternateServers) dnsArr.put(dns);
+                json.put("DNSResolverAlternateServers", dnsArr);
+            } else {
+                json.put("DNSResolverAlternateServers", new JSONArray("[\"1.1.1.1\", \"1.0.0.1\", \"8.8.8.8\", \"8.8.4.4\"]"));
+            }
 
             if (!TextUtils.isEmpty(tunnelConfig.deviceLocation)) {
                 json.put("DeviceLocation", tunnelConfig.deviceLocation);
@@ -1479,41 +1494,75 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             }
 
 
+            // ── GAMING MODE: Remote config (GearUP-style server push) ────────────────────────
+            // RemoteConfigManager fetches a JSON file from a configurable URL and caches the
+            // result.  Values override the hardcoded defaults below so they can be updated
+            // without shipping a new APK.  If no remote config has been fetched the built-in
+            // defaults below are used unchanged.
+            RemoteConfigManager.AppliedConfig rc = RemoteConfigManager.getApplied();
+            // ─────────────────────────────────────────────────────────────────────────────────
+
+            // ── GAMING MODE: Latency multiplier (server-tunable) ─────────────────────────────
+            // Default lambda = Psiphon default (fast aggressive timeouts, good for games).
+            // Server can set latencyMultiplierLambda to fine-tune per region if needed.
+            if (!temporaryTunnel && rc.latencyMultiplierLambda > 0) {
+                json.put("NetworkLatencyMultiplierLambda", rc.latencyMultiplierLambda);
+                MyLog.i("GamingMode: remote latency lambda = " + rc.latencyMultiplierLambda);
+            }
+
             // ── GAMING MODE: Prefer QUIC-OSSH, fall back to TCP if QUIC is blocked ─────────
             //
             // WHY InitialLimitTunnelProtocols instead of LimitTunnelProtocols:
             //   Hard lock = if QUIC is ISP-blocked the tunnel loops forever.
             //   Soft prefer = tries QUIC for first 5 candidates, then falls back.
             //
-            // WHY no NetworkLatencyMultiplierLambda:
-            //   Default lambda=2.0 -> mean multiplier 0.5 (timeouts faster).
-            //   We had 0.1 -> mean multiplier 10 (timeouts 20x SLOWER than default).
-            //   Games appeared hung because every handshake waited 10x too long.
-            //
-            // ── GAMING MODE: Soft region preference from UdpLatencyChecker ────────────
-            // UdpLatencyChecker probes Psiphon servers at connect-time and stores the top-5
-            // regions sorted by RTT.  We apply them as LimitServerEntryRegions (top 5,
-            // not 3) so Psiphon preferentially dials the closest nodes.  Using 5 gives
-            // enough fallback headroom that a single busy region won't block connection.
-            // On first run the prefs key is absent, so no restriction is applied.
-            String _fastestRegions = UdpLatencyChecker.getStoredFastestRegionsJson(context);
-            if (!_fastestRegions.isEmpty()) {
-                try {
-                    JSONArray _regions = new JSONArray(_fastestRegions);
-                    if (_regions.length() > 0) {
-                        json.put("LimitServerEntryRegions", _regions);
-                        MyLog.i("GamingMode: preferring regions " + _fastestRegions);
-                    }
-                } catch (JSONException ignored) {}
+            // ── GAMING MODE: Region preference — remote config overrides UdpLatencyChecker ──
+            // If the server supplied preferredRegions, use those directly.
+            // Otherwise fall back to UdpLatencyChecker's RTT-probed list.
+            if (rc.preferredRegions != null && !rc.preferredRegions.isEmpty()) {
+                JSONArray remoteRegions = new JSONArray();
+                for (String r : rc.preferredRegions) remoteRegions.put(r);
+                json.put("LimitServerEntryRegions", remoteRegions);
+                MyLog.i("GamingMode: remote preferred regions = " + rc.preferredRegions);
+            } else {
+                // UdpLatencyChecker probes Psiphon servers at connect-time and stores the top-5
+                // regions sorted by RTT.  We apply them as LimitServerEntryRegions (top 5,
+                // not 3) so Psiphon preferentially dials the closest nodes.  Using 5 gives
+                // enough fallback headroom that a single busy region won't block connection.
+                // On first run the prefs key is absent, so no restriction is applied.
+                String _fastestRegions = UdpLatencyChecker.getStoredFastestRegionsJson(context);
+                if (!_fastestRegions.isEmpty()) {
+                    try {
+                        JSONArray _regions = new JSONArray(_fastestRegions);
+                        if (_regions.length() > 0) {
+                            json.put("LimitServerEntryRegions", _regions);
+                            MyLog.i("GamingMode: UdpLatencyChecker regions = " + _fastestRegions);
+                        }
+                    } catch (JSONException ignored) {}
+                }
             }
-            //
+
+            // ── GAMING MODE: Protocol preference (server-tunable) ────────────────────────────
             JSONArray initialProtocols = new JSONArray();
-            initialProtocols.put("QUIC-OSSH");
+            if (rc.initialProtocols != null && !rc.initialProtocols.isEmpty()) {
+                for (String p : rc.initialProtocols) initialProtocols.put(p);
+                MyLog.i("GamingMode: remote initial protocols = " + rc.initialProtocols);
+            } else {
+                initialProtocols.put("QUIC-OSSH");
+            }
             json.put("InitialLimitTunnelProtocols", initialProtocols);
-            // Try 5 servers with QUIC preference before opening to all protocols
-            json.put("InitialLimitTunnelProtocolsCandidateCount", 5);
-            // 5 workers race in parallel — fastest server wins
-            json.put("ConnectionWorkerPoolSize", 5);
+
+            // Try N servers with protocol preference before opening to all protocols
+            json.put("InitialLimitTunnelProtocolsCandidateCount", rc.initialCandidateCount);
+
+            // N workers race in parallel — fastest server wins
+            json.put("ConnectionWorkerPoolSize", rc.connectionWorkerPoolSize);
+            MyLog.i("GamingMode: workers=" + rc.connectionWorkerPoolSize
+                    + " candidates=" + rc.initialCandidateCount
+                    + " dualChannel=" + rc.enableDualChannel
+                    + " sendBufKB=" + rc.udpSocketSendBufferKB
+                    + " recvBufKB=" + rc.udpSocketRecvBufferKB
+                    + " remoteCfgV=" + rc.configVersion);
             // ────────────────────────────────────────────────────────────────────────
             return json.toString();
         } catch (JSONException e) {

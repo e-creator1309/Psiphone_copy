@@ -63,11 +63,23 @@ public class GamingModeConfig {
     /**
      * Add bypass packages to the VPN builder.
      * Only call this when the builder is in disallowed-app mode (ALL_APPS or EXCLUDE_APPS).
+     *
+     * Merges the hardcoded BYPASS_PACKAGES list with any additional packages pushed
+     * via RemoteConfigManager (bypassPackages field in the remote JSON).
      */
     public static void applyBrowserBypass(VpnService.Builder vpnBuilder,
                                           PackageManager pm) {
+        // Build the combined set: hardcoded + remote
+        java.util.Set<String> allPackages = new java.util.LinkedHashSet<>();
+        for (String p : BYPASS_PACKAGES) allPackages.add(p);
+
+        RemoteConfigManager.AppliedConfig rc = RemoteConfigManager.getApplied();
+        if (rc.bypassPackages != null) {
+            allPackages.addAll(rc.bypassPackages);
+        }
+
         int applied = 0;
-        for (String pkg : BYPASS_PACKAGES) {
+        for (String pkg : allPackages) {
             try {
                 pm.getPackageInfo(pkg, 0); // check installed
                 vpnBuilder.addDisallowedApplication(pkg);
@@ -78,6 +90,7 @@ public class GamingModeConfig {
                 MyLog.w("GamingModeConfig: failed to bypass " + pkg + ": " + e.getMessage());
             }
         }
-        MyLog.i("GamingModeConfig: " + applied + " non-game apps bypassed (go direct)");
+        MyLog.i("GamingModeConfig: " + applied + " non-game apps bypassed (go direct)"
+                + (rc.bypassPackages != null ? " [+" + rc.bypassPackages.size() + " remote]" : ""));
     }
 }
