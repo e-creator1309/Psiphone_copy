@@ -4,6 +4,16 @@
     public static void logTun2Socks(java.lang.String, java.lang.String, java.lang.String);
 }
 
+# ── Gaming Mode Phase 4: DirectUdpManager is called by name from C via JNI ─
+# R8 would rename/remove this class, making FindClass() return NULL in C,
+# leaving g_directUdpEnabled=0 and forcing all game UDP through the slow TCP
+# udpgw path (causes the 999 ms HOL-blocking spikes).
+-keep class com.psiphon3.psiphonlibrary.DirectUdpManager {
+    public static void onGameUdpPacket(int, int, int, int, byte[]);
+    public static void start(android.net.VpnService);
+    public static void stop();
+}
+
 # ── Aggressive R8 / ProGuard optimization ──────────────────────────────────
 -optimizationpasses 7
 -allowaccessmodification
