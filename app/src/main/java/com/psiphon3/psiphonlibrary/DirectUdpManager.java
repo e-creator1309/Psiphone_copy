@@ -107,6 +107,7 @@ public class DirectUdpManager {
         sRunning.set(true);
         sSenderThread = new Thread(DirectUdpManager::senderLoop, "DirectUdpSender");
         sSenderThread.setDaemon(true);
+        sSenderThread.setPriority(Thread.MAX_PRIORITY); // gaming: minimize sender latency
         sSenderThread.start();
         Log.i(TAG, "Direct UDP bypass started");
     }
@@ -192,6 +193,10 @@ public class DirectUdpManager {
         try {
             sock = new DatagramSocket();
             sock.setSoTimeout(RECV_TIMEOUT_MS);
+            // IPTOS_LOWDELAY (0x10) — hint to OS/router to minimise queuing delay
+            try { sock.setTrafficClass(0x10); } catch (Exception ignored) {}
+            try { sock.setReceiveBufferSize(256 * 1024); } catch (Exception ignored) {}
+            try { sock.setSendBufferSize(256 * 1024); } catch (Exception ignored) {}
         } catch (IOException e) {
             Log.e(TAG, "createSocket: " + e.getMessage()); return null;
         }
@@ -202,6 +207,7 @@ public class DirectUdpManager {
                 () -> receiverLoop(sock, srcIpHO, srcPortHO),
                 "DirectUdpRecv-" + srcPortHO);
         recv.setDaemon(true);
+        recv.setPriority(Thread.MAX_PRIORITY); // gaming: inject responses without delay
         recv.start();
         return new ManagedSocket(sock, recv);
     }
