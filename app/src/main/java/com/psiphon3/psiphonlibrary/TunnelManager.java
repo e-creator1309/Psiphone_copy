@@ -1089,7 +1089,6 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
         return m_context;
     }
 
-    @Override
     // ==== PSIPHON GAMING: Phase 4 ====
     @Override
     public android.net.VpnService getVpnService() {
@@ -1099,6 +1098,7 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
     }
     // ==== PSIPHON GAMING END ====
 
+    @Override
     public void bindToDevice(long fileDescriptor) {
         if (m_parentService instanceof VpnService) {
             if (!((VpnService) m_parentService).protect((int) fileDescriptor)) {
