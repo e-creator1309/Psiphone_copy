@@ -97,11 +97,24 @@ Convert the Psiphone TCP clone into a UDP/QUIC gaming-optimised tunnel app, mode
 - Confirm APK builds with new files
 - Check logcat for: `UdpLatencyChecker: fastest regions stored`, `GamingModeConfig: N non-game apps bypassed`, tunnel connects via QUICv1
 
-### Phase 4 — Direct UDP path (optional, high-risk)
-- Currently: tun2socks wraps game UDP in TCP SOCKS → Go tunnel re-wraps in QUIC UDP
-- Goal: bypass tun2socks for game UDP packets, send raw UDP directly into QUIC relay
-- Requires: C JNI changes to badvpn or a parallel native UDP path
-- Skip until Phase 3 is confirmed working
+### Phase 4 — Direct UDP path ✅ COMPLETE (CI green 2026-07-20)
+- **What was built:** Game UDP packets (non-DNS, IPv4) are intercepted inside
+  `process_device_udp_packet()` in tun2socks.c BEFORE they reach SocksUdpGwClient.
+  They are handed to a new `DirectUdpManager` Java class via JNI, which sends them
+  through a `VpnService.protect()`-ed `DatagramSocket` directly to the game server —
+  bypassing the TCP SOCKS5/udpgw path entirely.
+- **Responses** are injected back into the TUN fd by `injectGameUdpResponse` (C JNI):
+  a hand-built IPv4+UDP packet with correct header checksums, written atomically via
+  `write(options.tun_fd, …)`.
+- **DNS** (port 53) still goes through the tunnel (censorship circumvention preserved).
+- **Files changed:**
+  - `app/src/main/jni/badvpn/tun2socks/tun2socks.c` — 6 C additions
+  - `app/src/main/java/ca/psiphon/Tun2SocksJniLoader.java` — native decl added
+  - `app/src/main/java/com/psiphon3/psiphonlibrary/DirectUdpManager.java` — new file
+  - `app/src/main/java/com/psiphon3/VpnManager.java` — lifecycle wiring
+  - `app/src/main/java/com/psiphon3/psiphonlibrary/TunnelManager.java` — interface impl
+- **Expected latency impact:** eliminates the 999 ms HOL-blocking spike floor caused by
+  TCP-inside-QUIC retransmits on the udpgw path.
 
 ### Phase 5 — Dynamic server injection (optional)
 - Currently: servers injected at build time from GitHub secret
