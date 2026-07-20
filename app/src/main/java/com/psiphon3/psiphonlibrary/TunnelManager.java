@@ -1490,9 +1490,22 @@ public class TunnelManager implements PsiphonTunnel.HostService, VpnManager.VpnS
             //   We had 0.1 -> mean multiplier 10 (timeouts 20x SLOWER than default).
             //   Games appeared hung because every handshake waited 10x too long.
             //
-            // WHY no LimitServerEntryRegions:
-            //   Restricting to 3 regions = no fallback if those servers are busy.
-            //   UdpLatencyChecker still probes in background; just not a hard filter.
+            // ── GAMING MODE: Soft region preference from UdpLatencyChecker ────────────
+            // UdpLatencyChecker probes Psiphon servers at connect-time and stores the top-5
+            // regions sorted by RTT.  We apply them as LimitServerEntryRegions (top 5,
+            // not 3) so Psiphon preferentially dials the closest nodes.  Using 5 gives
+            // enough fallback headroom that a single busy region won't block connection.
+            // On first run the prefs key is absent, so no restriction is applied.
+            String _fastestRegions = UdpLatencyChecker.getStoredFastestRegionsJson(context);
+            if (!_fastestRegions.isEmpty()) {
+                try {
+                    JSONArray _regions = new JSONArray(_fastestRegions);
+                    if (_regions.length() > 0) {
+                        json.put("LimitServerEntryRegions", _regions);
+                        MyLog.i("GamingMode: preferring regions " + _fastestRegions);
+                    }
+                } catch (JSONException ignored) {}
+            }
             //
             JSONArray initialProtocols = new JSONArray();
             initialProtocols.put("QUIC-OSSH");
