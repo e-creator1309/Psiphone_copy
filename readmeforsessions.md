@@ -132,3 +132,56 @@ Convert the Psiphone TCP clone into a UDP/QUIC gaming-optimised tunnel app, mode
 - **ConnectionWorkerPoolSize 5** — battery vs speed balance; tune up to 10 if needed
 - **EstablishTunnelPausePeriodSeconds 1** — fast reconnect matters for gaming (dropped connection = game kick)
 - **ca.psiphon.aar is custom-built arm64-only** — reduces APK size ~75%, requires CI to rebuild from source when tunnel-core changes
+
+---
+
+## Session 3 — GearUP Decompilation + Phase 6: dualChannel UDP
+
+### GearUP APK Analysis (reverse engineering)
+Decompiled `gearup.apk` (20 MB, `com.gearup.booster`) using jadx + apktool.
+
+**Architecture findings:**
+- `libdivider2.so` — proprietary C native library (full TCP/IP stack + KCP + sproxy)
+  - **KCP** (`kcp_bridge_*`) — reliable UDP protocol for low-latency tunneling
+  - **dualChannel** (`is_wifi_available_dual`, `is_mobile_available_dual`) — sends same packet over WiFi AND Cellular simultaneously
+  - **sproxy** — custom authenticated proxy protocol to GearUP's own servers
+  - P2P direct path with sproxy fallback
+- `DividerVpnService3.java` — TProxy-based VPN (not tun2socks+UDPGW)
+- `BoostProxy.java` — `tcpipOverUdp: boolean` flag — TCP/IP traffic tunneled over UDP transport
+- `TProxy.java` — per-region RTT measurement (iso2RTT map)
+- `AccConfig.java` — `udpSocketRecvBufferSize`, `udpSocketSendBufferSize`, `enableSproxyConfusion`
+
+**Why GearUP is faster (not copyable without their infrastructure):**
+1. Dedicated gaming servers geographically co-located with game servers
+2. KCP reliable UDP (faster ARQ than TCP) for the tunnel transport
+3. Their own optimized BGP routing
+
+**What IS copyable — dualChannel WiFi + Cellular:**
+GearUP sends each game UDP packet simultaneously over both physical interfaces.
+This eliminates the 999ms retransmit spikes: if WiFi drops a packet, Cellular delivers it.
+
+### Phase 6: DirectUdpManager dualChannel rewrite
+Replaced the single-socket Phase 4 implementation with a dual-socket design.
+
+**Key changes:**
+- `ManagedSession` (replaces `ManagedSocket`): holds `primary` (WiFi socket) + `secondary` (Cellular socket)
+- `detectNetworks(Context)`: uses `ConnectivityManager.getAllNetworks()` to find WiFi and Cellular `Network` objects (Android M+, degrades gracefully on older)
+- `openSocket(VpnService, Network)`: creates a `DatagramSocket`, calls `network.bindSocket()` to pin it to a physical interface, `vpn.protect()` to exclude from VPN routing
+- `dispatchPacket()`: sends each game UDP packet on BOTH sockets in the same call
+- `receiveLoop()`: uses actual datagram source address (`dgram.getAddress()`) instead of pre-configured dst — correctly handles NAT / load-balancer IPs
+- Receiver threads run at `Thread.MAX_PRIORITY`
+- Session key unchanged: `srcIpHO + ":" + srcPortHO`
+- Single-path graceful fallback when only one interface available
+
+**Expected result:**
+- 999ms spikes eliminated (dualChannel redundancy absorbs packet loss)
+- Base RTT unchanged (direct path latency is geographic, requires GearUP-style relay servers to reduce further)
+
+### Architecture decision: why NOT to copy GearUP's relay approach
+GearUP's 50-100ms ping vs our 300-400ms comes from **server infrastructure**, not software.
+Their servers sit in Singapore/Tokyo near game server datacenters, with direct peering.
+Psiphon servers are circumvention nodes, not gaming-optimized.
+To replicate GearUP's base latency, we would need to deploy our own relay servers.
+
+### Files changed this session
+- `app/src/main/java/com/psiphon3/psiphonlibrary/DirectUdpManager.java` — Phase 6 dualChannel rewrite
